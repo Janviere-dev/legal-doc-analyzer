@@ -1,94 +1,78 @@
 #  MINIJUST Legal Document Analyzer (AI Prototype)
 
-This is a specialized RAG (Retrieval-Augmented Generation) application developed for the **Ministry of Justice**. It allows users to upload legal documents and engage in a context-aware chat to extract insights and legal citations.
+This is a specialized **RAG (Retrieval-Augmented Generation)** application developed for the **Ministry of Justice**. It allows users to upload legal documents (PDF/Docx) and engage in a context-aware chat to extract insights and official legal citations.
 
 ##  Quick Start Instructions
 
 Follow these steps to set up the environment and run the application on your local machine.
 
 ### 1. Prerequisites
-* Ensure you have **Python 3.10 or higher** installed.
-* You will need a **Groq API Key** (and/or Gemini API key) to power the LLM.
 
-### 2. Installation
-Open your terminal in the project folder and run:
+* **Python 3.10+** installed on your system.
+* A **Groq API Key** (provided via email/private message).
 
-```bash
-# Create a virtual environment
-python3 -m venv .venv
+### 2. Installation & Setup
 
-# Activate the environment
-# On Windows: .venv\Scripts\activate
-# On macOS/Linux:
-source .venv/bin/activate
-
-# Install required libraries
-pip install -r requirements.txt
-
-To make sure your supervisor can run this without any "it's not working on my machine" headaches, your README.md needs to be professional, clear, and include a troubleshooting section.
-
-Here is a complete, ready-to-use README and the corresponding requirements.txt.
-
-1. The requirements.txt File
-Create a file named requirements.txt in your root folder and paste this:
-
-Plaintext
-
-streamlit
-langchain-huggingface
-langchain-community
-langchain-groq
-sentence-transformers
-pypdf2
-python-docx
-faiss-cpu
-python-dotenv
-2. The README.md File
-Create a file named README.md in your root folder and paste the following content:
-
-Markdown
-
-# ⚖️ MINIJUST Legal Document Analyzer (AI Prototype)
-
-This is a specialized RAG (Retrieval-Augmented Generation) application developed for the **Ministry of Justice**. It allows users to upload legal documents and engage in a context-aware chat to extract insights and legal citations.
-
-##  Quick Start Instructions
-
-Follow these steps to set up the environment and run the application on your local machine.
-
-### 1. Prerequisites
-* Ensure you have **Python 3.10 or higher** installed.
-* You will need a **Groq API Key** (and/or Gemini API key) to power the LLM.
-
-### 2. Installation
-Open your terminal in the project folder and run:
+Open your terminal in the project folder and run the following commands:
 
 ```bash
-# Create a virtual environment
+# 1. Create a virtual environment
 python3 -m venv .venv
 
-# Activate the environment
-# On Windows: .venv\Scripts\activate
-# On macOS/Linux:
+# 2. Activate the environment
+# On Windows use: .venv\Scripts\activate
+# On macOS/Linux use:
 source .venv/bin/activate
 
-# Install required libraries
+# 3. Install required libraries
 pip install -r requirements.txt
-### 3. Environment Setup
-Create a file named .env in the root directory and add your credentials:
-GROQ_API_KEY=your_key_here
 
-### 4. Running the App
-Launch the application with:
+```
 
-Bash
+### 3. Environment Configuration
 
+You must provide your API key for the AI to function:
+
+1. Create a new file in the root folder named `.env`
+2. Open the file and paste your key like this:
+`GROQ_API_KEY=your_actual_key_here`
+
+To get your **Groq API Key**, you just need to follow a few quick steps on their developer portal. It’s free and usually takes less than 60 seconds.
+
+### 🔑 Step-by-Step Guide
+
+1. **Visit the Console:** Go to [console.groq.com](https://console.groq.com).
+2. **Sign Up / Login:** You can use your **Google account** or GitHub to sign in instantly.
+3. **Navigate to Keys:** On the left-hand sidebar, click on the **"API Keys"** tab.
+4. **Create Key:** Click the button that says **"Create API Key"**.
+5. **Name It:** Give it a name like `MINIJUST_AI` so you remember what it's for.
+6. **Copy & Save:** **Crucial!** Once the key appears, copy it immediately. Groq will never show it to you again for security reasons.
+
+
+### 4. Running the Application
+
+Launch the prototype by running:
+
+```bash
 streamlit run app.py
-### Troubleshooting (If you have issues)
-"Module Not Found" Error: Ensure you have activated the virtual environment (source .venv/bin/activate) before running the app.
 
-"Externally Managed Environment": This means you are trying to install libraries globally. Always ensure the .venv is active.
+```
 
-API Key Error: Double-check that your .env file is named correctly and contains the valid key.
+---
 
-Slow PDF Processing: The first time you upload a document, the system generates "embeddings." This may take a moment depending on the document size.
+##  Troubleshooting
+
+* **"Module Not Found"**: This usually means the Virtual Environment is not active. Run `source .venv/bin/activate` again.
+* **"Externally Managed Environment"**: Ensure you have created and activated the `.venv` before running the `pip install` command.
+* **Empty Responses**: Check your internet connection and verify that your API key in the `.env` file is correct and has not expired.
+* **Processing Time**: Large PDF files may take a minute to "chunk" and index during the first upload.
+
+---
+
+**Vision 2026: A Year of Remarkable Change**
+
+---
+
+### 🚀 Next Step
+
+Now that your files are ready, would you like me to help you draft the **body of the email** that contains the **API Key** and the link to the GitHub repo so it looks professional for your supervisor?
