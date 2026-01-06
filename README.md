@@ -39,7 +39,7 @@ You must provide your API key for the AI to function:
 
 To get your **Groq API Key**, you just need to follow a few quick steps on their developer portal. It’s free and usually takes less than 60 seconds.
 
-### 🔑 Step-by-Step Guide
+###  Step-by-Step Guide
 
 1. **Visit the Console:** Go to [console.groq.com](https://console.groq.com).
 2. **Sign Up / Login:** You can use your **Google account** or GitHub to sign in instantly.
