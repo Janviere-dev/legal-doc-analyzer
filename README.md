@@ -70,9 +70,3 @@ streamlit run app.py
 ---
 
 **Vision 2026: A Year of Remarkable Change**
-
----
-
-### 🚀 Next Step
-
-Now that your files are ready, would you like me to help you draft the **body of the email** that contains the **API Key** and the link to the GitHub repo so it looks professional for your supervisor?
