@@ -1,21 +1,28 @@
-import streamlit as st
+import json
 import os
-from groq import Groq
+import re
+from typing import List, Dict, Any
+
+import streamlit as st
 from dotenv import load_dotenv
-# from utils import get_document_text, get_text_chunks, get_vector_store
+from groq import Groq
+
+from utils import _get_embeddings, _get_milvus_client
+
+
+load_dotenv()
 
 st.set_page_config(
-    page_title = "Chat", 
-    layout = "wide",
-    initial_sidebar_state = "expanded"
+    page_title="Chat",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Add branding to the sidebar (the look)
+# Sidebar: branding + document attachments
 with st.sidebar:
-    # check if the logo exist, otherwise show text
     try:
         st.logo("assets/minijust.png", icon_image="assets/minijust.png", size="large")
-    except:
+    except Exception:
         st.title("MINIJUST")
 
     footer = """
@@ -35,164 +42,259 @@ with st.sidebar:
     <div class="footer">
         <p>© 2026 MINIJUST AI | A Year of Remarkable Change</p>
     </div>
-"""
-st.markdown(footer, unsafe_allow_html=True)
+    """
+    st.markdown(footer, unsafe_allow_html=True)
 
 
-load_dotenv()
-client = Groq(api_key = os.getenv("GROQ_API_KEY"))
+# Session state for chat
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history: List[Dict[str, Any]] = []
+if "selected_docs" not in st.session_state:
+    st.session_state.selected_docs: List[str] = []
 
-st.title("MINIJUST AI Assistant")
 
-# The Dummy Database( this acts as our temporary storage for all past chats.)
-if "chat_archive" not in st.session_state:
-    st.session_state.chat_archive = [] # our dummy table
+def get_available_documents(data_folder: str = "data") -> List[str]:
+    if not os.path.exists(data_folder):
+        os.makedirs(data_folder)
+    return sorted([f for f in os.listdir(data_folder) if os.path.isfile(os.path.join(data_folder, f))])
 
-# Current session
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
-# Sidebar: History Vault 
-with st.sidebar:
-    st.header("Past Conversations")
-    if not st.session_state.chat_archive:
-        st.write("No saved chats yet.")
-    else:
-        for i, past_chat in enumerate(st.session_state.chat_archive):
-            # show button for each saved chat
-            if st.button(f"chat {i+1}: {past_chat['title']}", key= f"archive_{i}"):
-                st.session_state.messages = past_chat["content"]
+def build_filter_expression(selected_docs: List[str]) -> str:
+    if not selected_docs:
+        return ""
+    quoted = [f'"{d}"' for d in selected_docs]
+    return f"source_file in [{', '.join(quoted)}]"
 
-if st.button("➕ New chat", use_container_width=True):
-    # save current chat to archive before clearing
-    if st.session_state.messages:
-        first_msg = st.session_state.messages[0]["content"][:20]
-        st.session_state.chat_archive.append({
-            "title": f"{first_msg}...",
-            "content": st.session_state.messages
-        })
-        st.session_state.messages = []
-        st.rerun()
 
-# Chat interface
-for message in st.session_state.messages:
+def _extract_article_numbers(question: str) -> List[str]:
+    """
+    Best-effort extraction of article numbers from the question.
+    Supports patterns like:
+    - Article 14
+    - article 14
+    - Ingingo ya 14
+    """
+    nums = set()
+    # English / French style: “Article 14”
+    for m in re.findall(r"[Aa]rticle\s+(\d+)", question):
+        nums.add(m)
+    # Kinyarwanda style: “Ingingo ya 14”
+    for m in re.findall(r"[Ii]ngingo\s+ya\s+(\d+)", question):
+        nums.add(m)
+    return sorted(nums)
+
+
+def search_context(question: str, selected_docs: List[str], top_k: int = 5) -> List[Dict[str, Any]]:
+    embeddings = _get_embeddings()
+    query_vec = embeddings.embed_query(question)
+
+    client = _get_milvus_client()
+    collection_name = "legal_docs"
+    if not client.has_collection(collection_name):
+        raise RuntimeError("No Milvus collection found. Please ingest documents on the Upload page.")
+
+    filter_expr = build_filter_expression(selected_docs)
+
+    # 1) Semantic search for general relevant context
+    results = client.search(
+        collection_name=collection_name,
+        data=[query_vec],
+        limit=top_k,
+        output_fields=["text", "source_file", "page", "unit_header", "metadata_json"],
+        filter=filter_expr or None,
+        search_params={"metric_type": "COSINE", "params": {"nprobe": 10}},
+    )
+
+    hits = results[0] if results else []
+    contexts: List[Dict[str, Any]] = []
+    for hit in hits:
+        meta_raw = hit.get("metadata_json") or "{}"
+        try:
+            meta = json.loads(meta_raw)
+        except Exception:
+            meta = {}
+        contexts.append(
+            {
+                "text": hit.get("text", ""),
+                "source_file": hit.get("source_file", "unknown"),
+                "page": hit.get("page", None),
+                "unit_header": hit.get("unit_header", ""),
+                "metadata": meta,
+                "score": hit.get("score", hit.get("distance")),
+            }
+        )
+
+    # 2) If the question clearly refers to a specific article number,
+    #    pull *all* chunks for that article (per document) so the lawyer
+    #    can see the full text, not just partial snippets.
+    article_numbers = _extract_article_numbers(question)
+    if article_numbers:
+        try:
+            for art_num in article_numbers:
+                def _run_article_query(filter_clause: str) -> List[Dict[str, Any]]:
+                    rows_local = client.query(
+                        collection_name=collection_name,
+                        filter=filter_clause,
+                        output_fields=["text", "source_file", "page", "unit_header", "metadata_json", "article_number"],
+                        limit=200,
+                    )
+                    return rows_local or []
+
+                # Prefer precise article_number field, which we populate at ingestion time.
+                expr_parts = []
+                if filter_expr:
+                    expr_parts.append(f"({filter_expr})")
+                expr_parts.append(f'article_number == "{art_num}"')
+                expr = " and ".join(expr_parts) if len(expr_parts) > 1 else expr_parts[0]
+                rows = _run_article_query(expr)
+
+                # Backward-compatible fallback for already-indexed docs (before article_number existed)
+                if not rows:
+                    expr_parts_fallback = []
+                    if filter_expr:
+                        expr_parts_fallback.append(f"({filter_expr})")
+                    expr_parts_fallback.append(
+                        f'(unit_header == "Article {art_num}" or unit_header == "Ingingo ya {art_num}" or unit_header == "ARTICLE {art_num}")'
+                    )
+                    expr_fb = (
+                        " and ".join(expr_parts_fallback)
+                        if len(expr_parts_fallback) > 1
+                        else expr_parts_fallback[0]
+                    )
+                    rows = _run_article_query(expr_fb)
+
+                if not rows:
+                    continue
+
+                # Group by (source_file, unit_header) and concatenate all chunks
+                grouped: Dict[str, List[Dict[str, Any]]] = {}
+                for r in rows:
+                    key = f"{r.get('source_file','unknown')}|{r.get('unit_header','')}"
+                    grouped.setdefault(key, []).append(r)
+
+                for key, chunks in grouped.items():
+                    chunks_sorted = sorted(chunks, key=lambda x: x.get("page", 0) or 0)
+                    full_text = "\n\n".join(c.get("text", "") for c in chunks_sorted if c.get("text"))
+                    first = chunks_sorted[0]
+                    meta_raw = first.get("metadata_json") or "{}"
+                    try:
+                        meta = json.loads(meta_raw)
+                    except Exception:
+                        meta = {}
+
+                    # Avoid duplicating if the same (file, header) is already in contexts
+                    if any(
+                        c.get("source_file") == first.get("source_file")
+                        and c.get("unit_header") == first.get("unit_header")
+                        for c in contexts
+                    ):
+                        continue
+
+                    contexts.insert(
+                        0,
+                        {
+                            "text": full_text,
+                            "source_file": first.get("source_file", "unknown"),
+                            "page": first.get("page", None),
+                            "unit_header": first.get("unit_header", ""),
+                            "metadata": meta,
+                            "score": 1.0,  # highest priority
+                        },
+                    )
+        except Exception:
+            # If article-aware fallback fails for any reason, we still
+            # return the normal semantic contexts so the chat keeps working.
+            pass
+
+    return contexts
+
+
+def generate_answer(question: str, contexts: List[Dict[str, Any]]) -> str:
+    context_blocks = []
+    for idx, ctx in enumerate(contexts, start=1):
+        page_info = f"(page {ctx['page']})" if ctx.get("page") else ""
+        header = ctx.get("unit_header", "") or ""
+        header_line = f" — {header}" if header else ""
+        context_blocks.append(f"[{idx}] {ctx['source_file']}{header_line} {page_info}\n{ctx['text']}")
+    context_str = "\n\n".join(context_blocks) if context_blocks else "No supporting passages found."
+
+    system_prompt = (
+        "You are MINIJUST's legal research assistant. Provide concise, factual answers "
+        "grounded in the retrieved context. Cite the supporting snippet numbers when relevant. "
+        "If the context is missing, say you cannot find that information."
+    )
+
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    completion = client.chat.completions.create(
+        model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        temperature=0.2,
+        max_tokens=512,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Question: {question}\n\nContext:\n{context_str}",
+            },
+        ],
+    )
+    return completion.choices[0].message.content.strip()
+
+
+st.title("Chat with Indexed Documents")
+st.caption("Attach one or more indexed documents, ask a question, and search around them.")
+
+available_docs = get_available_documents()
+if not available_docs:
+    st.warning("No documents found. Please upload and index files on the Upload page.")
+else:
+    st.info(
+        "Tip: If a document was indexed before we added article-level metadata, re-upload it once on the Upload page "
+        "to enable reliable full-article retrieval (e.g., 'Article 14')."
+    )
+
+# Show prior messages
+for message in st.session_state.chat_history:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        st.write(message["content"])
+        sources = message.get("sources") or []
+        if sources:
+            with st.expander("Sources"):
+                for s in sources:
+                    page_info = f" (page {s['page']})" if s.get("page") else ""
+                    header = s.get("unit_header") or ""
+                    header_info = f" — {header}" if header else ""
+                    full_text = s.get("text", "")
+                    snippet_len = 400
+                    snippet = full_text[:snippet_len]
+                    st.markdown(
+                        f"- `{s['source_file']}`{header_info}{page_info}: "
+                        f"{snippet}{'…' if len(full_text) > len(snippet) else ''}"
+                    )
+                    if header and len(full_text) > snippet_len:
+                        with st.expander(f"View full text for {header}"):
+                            st.write(full_text)
 
-if prompt := st.chat_input("What can I help you with?"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+# Chat input area
+with st.form("chat_form", clear_on_submit=True):
+    st.subheader("Attach documents to search")
+    selected = st.multiselect(
+        "Indexed documents",
+        options=available_docs,
+        default=st.session_state.selected_docs,
+        help="Only chunks from these files will be searched. Leave empty to search all indexed content.",
+    )
+    question = st.text_area("Your question", placeholder="Ask about a specific article or case...", height=120)
+    top_k = st.slider("Results to retrieve", min_value=3, max_value=10, value=5, step=1)
+    submitted = st.form_submit_button("Ask")
 
-        with st.chat_message("assistant"):
-            response = client.chat.completions.create(
-                model = "llama-3.3-70b-versatile",
-                messages = [{"role": "user", "content": prompt}],
-            )
-            # context = " ".join(chunks[:3]) # For now, we take the first 3 chunks as a test
-            # system_prompt = f"You are a legal assistant. Use this document context to answer: {context}"
-
-            # response = client.chat.completions.create(
-            #     model="llama-3.3-70b-versatile",
-            #     messages=[
-            #         {"role": "system", "content": system_prompt},
-            #         {"role": "user", "content": prompt}
-            #     ],
-            # )
-            full_response = response.choices[0].message.content
-            st.markdown(full_response)
-
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
-
-# # selecting a specific document
-# DATA_PATH = "data"
-
-# if os.path.exists(DATA_PATH):
-#     files = [ f for f in os.listdir(DATA_PATH) if f.endswith((".pdf", ".docx"))]
-# else:
-#     files = []
-#     st.error("Data folder empty")
-# # if files:
-# #     selected_doc = st.selectbox("Select document:", files)
-# #     file_path = os.path.join("data", selected_doc)
-# # 2. Create a layout for the "Plus" button and the Chat
-# # We use a popover to hide the file list until the "+" is clicked
-# # with st.sidebar:
-# #     st.title("📎 Attachments")
-# #     if files:
-# #         selected_file = st.selectbox("Attach a document to your next message:", ["None"] + files)
-# #     else:
-# #         st.info("No documents found in 'data' folder.")
-
-# # # 3. Chat Input Area
-# # if prompt := st.chat_input("Type your message..."):
-    
-# #     # Check if a document is attached
-# #     context = ""
-# #     if selected_file != "None":
-# #         with st.status(f"Reading {selected_file}...", expanded=False):
-# #             file_path = os.path.join(DATA_PATH, selected_file)
-# #             raw_text = get_document_text(file_path)
-# #             chunks = get_text_chunks(raw_text)
-# #             vector_store = get_vector_store(chunks)
-            
-# #             # Find the parts of the doc related to the user's "few words"
-# #             docs = vector_store.similarity_search(prompt, k=3)
-# #             context = "\n".join([doc.page_content for doc in docs])
-
-# #     # 4. Display user message
-# #     st.session_state.messages.append({"role": "user", "content": prompt})
-# #     with st.chat_message("user"):
-# #         st.markdown(prompt)
-# #         if selected_file != "None":
-# #             st.caption(f"📎 Attached: {selected_file}")
-
-# #     # 5. Generate AI Response with Context
-# #     with st.chat_message("assistant"):
-# #         # We tell the AI: Use the document context ONLY IF it exists
-# #         system_instructions = "You are a legal assistant."
-# #         if context:
-# #             system_instructions += f"\n\nUse this document context to help answer:\n{context}"
-
-# #         response = client.chat.completions.create(
-# #             model="llama-3.3-70b-versatile",
-# #             messages=[
-# #                 {"role": "system", "content": system_instructions},
-# #                 {"role": "user", "content": prompt}
-# #             ]
-# #         )
-# #         # ... (rest of your response logic)
-
-# # 1. THE "PLUS SIGN" POPOVER
-# # We place this right above or beside the chat input
-# col1, col2 = st.columns([0.1, 0.9])
-
-# with col1:
-#     with st.popover("➕"):
-#         st.markdown("**Attach Document**")
-#         files = [f for f in os.listdir("data") if f.endswith(('.pdf', '.docx'))]
-#         selected_file = st.radio("Choose a file to analyze:", ["None"] + files)
-
-# with col2:
-#     prompt = st.chat_input("Ask a question or give instructions about the file...")
-
-# # 2. THE LOGIC
-# if prompt:
-#     context = ""
-#     if selected_file != "None":
-#         # This is where the RAG magic happens
-#         with st.spinner(f"Analyzing {selected_file}..."):
-#             path = os.path.join("data", selected_file)
-#             raw_text = get_document_text(path)
-#             chunks = get_text_chunks(raw_text)
-#             vs = get_vector_store(chunks)
-            
-#             # Find the most relevant parts of the doc
-#             relevant_docs = vs.similarity_search(prompt, k=3)
-#             context = "\n".join([d.page_content for d in relevant_docs])
-
-#     # Extract the text
-#     raw_text = get_document_text(file_path)
-#     chunks = get_text_chunks(raw_text)
-
-#     st.success(f"Successfully processed {len(chunks)} sections of the document.")
+if submitted and question:
+    st.session_state.selected_docs = selected
+    with st.spinner("Retrieving context and querying Groq..."):
+        try:
+            contexts = search_context(question, selected, top_k=top_k)
+            answer = generate_answer(question, contexts)
+            st.session_state.chat_history.append({"role": "user", "content": question})
+            st.session_state.chat_history.append({"role": "assistant", "content": answer, "sources": contexts})
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not complete the request: {str(e)}")
