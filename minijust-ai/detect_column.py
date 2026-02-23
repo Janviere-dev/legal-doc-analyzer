@@ -173,7 +173,6 @@ def reconstruct_text_reading_order(column, line_height_threshold=5, add_line_bre
         # Join words in this line with spaces
         line_text = ' '.join(word['text'] for word in line)
         text_lines.append(line_text)
-        print(text_lines)
     
     # Join lines
     if add_line_breaks:
