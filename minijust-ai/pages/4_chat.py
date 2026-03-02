@@ -1,28 +1,24 @@
-import json
-import os
-import re
-from typing import List, Dict, Any
-
 import streamlit as st
+import os
+import json
+from typing import List, Dict
 from dotenv import load_dotenv
+from utils import load_vector_store, search_documents
 from groq import Groq
-
-from utils import _get_embeddings, _get_milvus_client
-
 
 load_dotenv()
 
 st.set_page_config(
-    page_title="Chat",
+    page_title="Legal Chat",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-# Sidebar: branding + document attachments
+# Add branding to the sidebar
 with st.sidebar:
     try:
         st.logo("assets/minijust.png", icon_image="assets/minijust.png", size="large")
-    except Exception:
+    except:
         st.title("MINIJUST")
 
     footer = """
@@ -42,259 +38,298 @@ with st.sidebar:
     <div class="footer">
         <p>© 2026 MINIJUST AI | A Year of Remarkable Change</p>
     </div>
+"""
+st.markdown(footer, unsafe_allow_html=True)
+
+# Initialize session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "selected_files" not in st.session_state:
+    st.session_state.selected_files = []
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def load_registry():
+    """Load document registry"""
+    registry_file = "data/document_registry.json"
+    if os.path.exists(registry_file):
+        with open(registry_file, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+def get_groq_client() -> Groq:
+    """Initialize Groq client"""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY not found in environment variables")
+    return Groq(api_key=api_key)
+
+
+def scout_phase(user_question: str, groq_client: Groq) -> str:
     """
-    st.markdown(footer, unsafe_allow_html=True)
-
-
-# Session state for chat
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history: List[Dict[str, Any]] = []
-if "selected_docs" not in st.session_state:
-    st.session_state.selected_docs: List[str] = []
-
-
-def get_available_documents(data_folder: str = "data") -> List[str]:
-    if not os.path.exists(data_folder):
-        os.makedirs(data_folder)
-    return sorted([f for f in os.listdir(data_folder) if os.path.isfile(os.path.join(data_folder, f))])
-
-
-def build_filter_expression(selected_docs: List[str]) -> str:
-    if not selected_docs:
-        return ""
-    quoted = [f'"{d}"' for d in selected_docs]
-    return f"source_file in [{', '.join(quoted)}]"
-
-
-def _extract_article_numbers(question: str) -> List[str]:
+    Phase 1: Use Groq to extract search terms and identify relevant legal categories
     """
-    Best-effort extraction of article numbers from the question.
-    Supports patterns like:
-    - Article 14
-    - article 14
-    - Ingingo ya 14
-    """
-    nums = set()
-    # English / French style: “Article 14”
-    for m in re.findall(r"[Aa]rticle\s+(\d+)", question):
-        nums.add(m)
-    # Kinyarwanda style: “Ingingo ya 14”
-    for m in re.findall(r"[Ii]ngingo\s+ya\s+(\d+)", question):
-        nums.add(m)
-    return sorted(nums)
+    scout_prompt = f"""You are a legal research assistant for the Rwandan Justice System.
 
+The user asked: "{user_question}"
 
-def search_context(question: str, selected_docs: List[str], top_k: int = 5) -> List[Dict[str, Any]]:
-    embeddings = _get_embeddings()
-    query_vec = embeddings.embed_query(question)
+Your task is to identify the most relevant search terms and legal categories to retrieve from a vector database.
 
-    client = _get_milvus_client()
-    collection_name = "legal_docs"
-    if not client.has_collection(collection_name):
-        raise RuntimeError("No Milvus collection found. Please ingest documents on the Upload page.")
+Based on this question, identify:
+1. Key legal concepts or topics (e.g., Land Law, Penal Code, Family Law, Contract Law, etc.)
+2. Specific article numbers or legal references if mentioned
+3. Important keywords in English, French, or Kinyarwanda
 
-    filter_expr = build_filter_expression(selected_docs)
+Return ONLY a concise list of search terms (2-5 terms maximum), separated by commas. Do not answer the question yet.
 
-    # 1) Semantic search for general relevant context
-    results = client.search(
-        collection_name=collection_name,
-        data=[query_vec],
-        limit=top_k,
-        output_fields=["text", "source_file", "page", "unit_header", "metadata_json"],
-        filter=filter_expr or None,
-        search_params={"metric_type": "COSINE", "params": {"nprobe": 10}},
-    )
+Example output format: "land ownership, Article 91, ubukode, property rights"
 
-    hits = results[0] if results else []
-    contexts: List[Dict[str, Any]] = []
-    for hit in hits:
-        meta_raw = hit.get("metadata_json") or "{}"
-        try:
-            meta = json.loads(meta_raw)
-        except Exception:
-            meta = {}
-        contexts.append(
-            {
-                "text": hit.get("text", ""),
-                "source_file": hit.get("source_file", "unknown"),
-                "page": hit.get("page", None),
-                "unit_header": hit.get("unit_header", ""),
-                "metadata": meta,
-                "score": hit.get("score", hit.get("distance")),
-            }
-        )
+Search terms:"""
 
-    # 2) If the question clearly refers to a specific article number,
-    #    pull *all* chunks for that article (per document) so the lawyer
-    #    can see the full text, not just partial snippets.
-    article_numbers = _extract_article_numbers(question)
-    if article_numbers:
-        try:
-            for art_num in article_numbers:
-                def _run_article_query(filter_clause: str) -> List[Dict[str, Any]]:
-                    rows_local = client.query(
-                        collection_name=collection_name,
-                        filter=filter_clause,
-                        output_fields=["text", "source_file", "page", "unit_header", "metadata_json", "article_number"],
-                        limit=200,
-                    )
-                    return rows_local or []
-
-                # Prefer precise article_number field, which we populate at ingestion time.
-                expr_parts = []
-                if filter_expr:
-                    expr_parts.append(f"({filter_expr})")
-                expr_parts.append(f'article_number == "{art_num}"')
-                expr = " and ".join(expr_parts) if len(expr_parts) > 1 else expr_parts[0]
-                rows = _run_article_query(expr)
-
-                # Backward-compatible fallback for already-indexed docs (before article_number existed)
-                if not rows:
-                    expr_parts_fallback = []
-                    if filter_expr:
-                        expr_parts_fallback.append(f"({filter_expr})")
-                    expr_parts_fallback.append(
-                        f'(unit_header == "Article {art_num}" or unit_header == "Ingingo ya {art_num}" or unit_header == "ARTICLE {art_num}")'
-                    )
-                    expr_fb = (
-                        " and ".join(expr_parts_fallback)
-                        if len(expr_parts_fallback) > 1
-                        else expr_parts_fallback[0]
-                    )
-                    rows = _run_article_query(expr_fb)
-
-                if not rows:
-                    continue
-
-                # Group by (source_file, unit_header) and concatenate all chunks
-                grouped: Dict[str, List[Dict[str, Any]]] = {}
-                for r in rows:
-                    key = f"{r.get('source_file','unknown')}|{r.get('unit_header','')}"
-                    grouped.setdefault(key, []).append(r)
-
-                for key, chunks in grouped.items():
-                    chunks_sorted = sorted(chunks, key=lambda x: x.get("page", 0) or 0)
-                    full_text = "\n\n".join(c.get("text", "") for c in chunks_sorted if c.get("text"))
-                    first = chunks_sorted[0]
-                    meta_raw = first.get("metadata_json") or "{}"
-                    try:
-                        meta = json.loads(meta_raw)
-                    except Exception:
-                        meta = {}
-
-                    # Avoid duplicating if the same (file, header) is already in contexts
-                    if any(
-                        c.get("source_file") == first.get("source_file")
-                        and c.get("unit_header") == first.get("unit_header")
-                        for c in contexts
-                    ):
-                        continue
-
-                    contexts.insert(
-                        0,
-                        {
-                            "text": full_text,
-                            "source_file": first.get("source_file", "unknown"),
-                            "page": first.get("page", None),
-                            "unit_header": first.get("unit_header", ""),
-                            "metadata": meta,
-                            "score": 1.0,  # highest priority
-                        },
-                    )
-        except Exception:
-            # If article-aware fallback fails for any reason, we still
-            # return the normal semantic contexts so the chat keeps working.
-            pass
-
-    return contexts
-
-
-def generate_answer(question: str, contexts: List[Dict[str, Any]]) -> str:
-    context_blocks = []
-    for idx, ctx in enumerate(contexts, start=1):
-        page_info = f"(page {ctx['page']})" if ctx.get("page") else ""
-        header = ctx.get("unit_header", "") or ""
-        header_line = f" — {header}" if header else ""
-        context_blocks.append(f"[{idx}] {ctx['source_file']}{header_line} {page_info}\n{ctx['text']}")
-    context_str = "\n\n".join(context_blocks) if context_blocks else "No supporting passages found."
-
-    system_prompt = (
-        "You are MINIJUST's legal research assistant. Provide concise, factual answers "
-        "grounded in the retrieved context. Cite the supporting snippet numbers when relevant. "
-        "If the context is missing, say you cannot find that information."
-    )
-
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    completion = client.chat.completions.create(
-        model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+    response = groq_client.chat.completions.create(
+        messages=[{"role": "user", "content": scout_prompt}],
+        model="llama-3.3-70b-versatile",
         temperature=0.2,
-        max_tokens=512,
+        max_tokens=200,
+    )
+    
+    return response.choices[0].message.content.strip()
+
+
+def retrieve_chunks(search_terms: str, selected_files: List[str] = None, top_k: int = 5) -> List[Dict]:
+    """
+    Phase 2: Retrieve relevant chunks from FAISS vector store
+    """
+    # Build metadata filter for selected files
+    filter_dict = None
+    if selected_files and len(selected_files) > 0:
+        filter_dict = {"source_file": selected_files}
+
+    # Search in FAISS using utils.search_documents
+    # Filtering is handled inside search_documents with progressive over-fetching.
+    documents = search_documents(search_terms, k=top_k, filter_dict=filter_dict)
+    
+    # Convert to chunk format
+    chunks = []
+    for doc in documents:
+        chunks.append({
+            "text": doc.page_content,
+            "source_file": doc.metadata.get("source_file", "Unknown"),
+            "doc_type": doc.metadata.get("doc_type", "Unknown"),
+            "language": doc.metadata.get("language", "en"),
+            "page": doc.metadata.get("page", 0),
+            "article_number": doc.metadata.get("article_number", ""),
+            "unit_header": doc.metadata.get("article_title", ""),
+            "distance": 0.0,  # FAISS uses similarity, not distance in our abstraction
+        })
+    
+    return chunks
+
+
+def format_retrieved_data(chunks: List[Dict]) -> str:
+    """Format chunks for inclusion in the prompt"""
+    if not chunks:
+        return "No relevant documents found in the database."
+    
+    formatted = "RETRIEVED LEGAL DOCUMENTS:\n\n"
+    for i, chunk in enumerate(chunks, 1):
+        formatted += f"--- Document {i} ---\n"
+        formatted += f"Source: {chunk['source_file']}\n"
+        formatted += f"Type: {chunk['doc_type']}\n"
+        formatted += f"Language: {chunk['language']}\n"
+        formatted += f"Page: {chunk['page']}\n"
+        
+        if chunk['article_number']:
+            formatted += f"Article: {chunk['article_number']}\n"
+        if chunk['unit_header']:
+            formatted += f"Section: {chunk['unit_header']}\n"
+        
+        formatted += f"\nContent:\n{chunk['text']}\n\n"
+    
+    return formatted
+
+
+def answer_phase(user_question: str, retrieved_data: str, groq_client: Groq) -> str:
+    """
+    Phase 3: Use Groq to answer the question based on retrieved chunks
+    """
+    system_prompt = """You are an expert legal assistant for the Rwandan Justice System. Your role is to provide DIRECT, CLEAR answers to legal questions using the provided document excerpts.
+
+CRITICAL INSTRUCTIONS:
+
+1. **ANSWER FIRST, DON'T JUST CITE**: 
+   - DO NOT just tell the user "Article X says..." or "You can find this in..."
+   - DIRECTLY answer their question by QUOTING and EXPLAINING the relevant legal text
+   - Extract and present the ACTUAL content they need to know
+   
+2. **Use the Actual Legal Text**:
+   - Quote the relevant parts of articles/laws DIRECTLY
+   - Explain what those quotes mean in practical terms
+   - If the law says "A person must do X, Y, Z", tell them: "You must do X, Y, and Z"
+   
+3. **Answer Structure** (MUST follow this order):
+   
+   [Give a clear, actionable answer in 2-3 sentences. State exactly what the law says about their question.]
+   
+   [Quote the relevant article/section directly from the documents. Use quotation marks for exact text.]
+   
+   [Explain what this means in plain language. Break down requirements, procedures, or implications.]
+   
+   [List the source documents: filename, article number, page number]
+
+# 4. **Practical Example**:
+#    ❌ BAD: "According to Article 4, you can find the criteria in the document..."
+#    ✅ GOOD: "To settle persons in Rwanda, you must meet these criteria: (1) Be a Rwandan citizen or legally recognized refugee, (2) Have proper identification documents, (3) Demonstrate economic capability. This is stated in Article 4 which specifies..."
+
+5. **Language**: Respond in the same language as the question. Preserve legal terminology accurately.
+
+6. **If Information is Missing**: Say "Based on the documents I have access to, I don't have specific information about [topic]. However, what I can tell you is..." Then provide related information if available."""
+
+    user_prompt = f"""{retrieved_data}
+
+USER QUESTION:
+{user_question}
+
+Provide a complete answer with the actual legal content, not just references to where it can be found."""
+
+    response = groq_client.chat.completions.create(
         messages=[
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"Question: {question}\n\nContext:\n{context_str}",
-            },
+            {"role": "user", "content": user_prompt}
         ],
+        model="llama-3.3-70b-versatile",
+        temperature=0.3,
+        max_tokens=2000,
     )
-    return completion.choices[0].message.content.strip()
+    
+    return response.choices[0].message.content.strip()
 
 
-st.title("Chat with Indexed Documents")
-st.caption("Attach one or more indexed documents, ask a question, and search around them.")
+# ============================================================
+# MAIN UI
+# ============================================================
 
-available_docs = get_available_documents()
-if not available_docs:
-    st.warning("No documents found. Please upload and index files on the Upload page.")
+st.title("🏛️ Legal Document Chat")
+st.write("Ask questions about your indexed Rwandan legal documents")
+
+# Check if FAISS index exists
+vector_store = load_vector_store()
+if not vector_store:
+    st.warning("⚠️ No documents indexed yet. Please upload documents in the **Upload** page first.")
+    st.stop()
+
+# File selection from library
+st.sidebar.header("📚 Document Selection")
+
+# Load registry to show indexed documents
+registry = load_registry()
+if registry:
+    st.sidebar.write("Select specific documents to search (leave empty for all):")
+    
+    # Create checkboxes for each indexed file
+    selected = []
+    for filename, info in registry.items():
+        label = f"{filename} ({info['doc_type']}, {info['num_chunks']} chunks)"
+        if st.sidebar.checkbox(label, key=f"file_{filename}"):
+            selected.append(filename)
+    
+    st.session_state.selected_files = selected
+    
+    if selected:
+        st.sidebar.success(f"✅ {len(selected)} document(s) selected")
+    else:
+        st.sidebar.info("🔍 Searching all indexed documents")
 else:
-    st.info(
-        "Tip: If a document was indexed before we added article-level metadata, re-upload it once on the Upload page "
-        "to enable reliable full-article retrieval (e.g., 'Article 14')."
-    )
+    st.sidebar.warning("No documents in registry. Upload documents in the **Upload** page.")
 
-# Show prior messages
-for message in st.session_state.chat_history:
+# Display chat history
+for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.write(message["content"])
-        sources = message.get("sources") or []
-        if sources:
-            with st.expander("Sources"):
-                for s in sources:
-                    page_info = f" (page {s['page']})" if s.get("page") else ""
-                    header = s.get("unit_header") or ""
-                    header_info = f" — {header}" if header else ""
-                    full_text = s.get("text", "")
-                    snippet_len = 400
-                    snippet = full_text[:snippet_len]
-                    st.markdown(
-                        f"- `{s['source_file']}`{header_info}{page_info}: "
-                        f"{snippet}{'…' if len(full_text) > len(snippet) else ''}"
+        st.markdown(message["content"])
+
+# Chat input
+if prompt := st.chat_input("Ask a legal question..."):
+    # Add user message to chat
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    # Process the query
+    with st.chat_message("assistant"):
+        with st.spinner("🔍 Analyzing your question..."):
+            try:
+                # Initialize Groq client
+                groq_client = get_groq_client()
+                
+                # Phase 1: Scout - Extract search terms
+                with st.status("Processing your question...", expanded=True) as status:
+                    st.write("🔎 Phase 1: Identifying relevant legal categories...")
+                    search_terms = scout_phase(prompt, groq_client)
+                    st.write(f"**Search terms identified**: {search_terms}")
+                    
+                    # Phase 2: Retrieve relevant chunks from FAISS
+                    st.write("📚 Phase 2: Retrieving relevant documents from FAISS index...")
+                    chunks = retrieve_chunks(
+                        search_terms, 
+                        st.session_state.selected_files,
+                        top_k=5
                     )
-                    if header and len(full_text) > snippet_len:
-                        with st.expander(f"View full text for {header}"):
-                            st.write(full_text)
+                    st.write(f"**Retrieved**: {len(chunks)} document chunks")
+                    
+                    # Phase 3: Generate answer
+                    st.write("💡 Phase 3: Generating answer with Groq LLM...")
+                    retrieved_data = format_retrieved_data(chunks)
+                    answer = answer_phase(prompt, retrieved_data, groq_client)
+                    
+                    status.update(label="✅ Analysis complete!", state="complete", expanded=False)
+                
+                # Display the answer
+                st.markdown(answer)
+                
+                # Show sources in an expander
+                if chunks:
+                    with st.expander("📖 View Sources"):
+                        for i, chunk in enumerate(chunks, 1):
+                            st.markdown(f"**Source {i}**: {chunk['source_file']}")
+                            st.markdown(f"- Type: {chunk['doc_type']}")
+                            st.markdown(f"- Page: {chunk['page']}")
+                            if chunk['article_number']:
+                                st.markdown(f"- Article: {chunk['article_number']}")
+                            st.markdown("---")
+                
+                # Add assistant response to chat history
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+                
+            except ValueError as e:
+                error_msg = f"⚠️ Configuration Error: {str(e)}\n\nPlease add GROQ_API_KEY to your .env file."
+                st.error(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            except Exception as e:
+                error_msg = f"❌ Error: {str(e)}"
+                st.error(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
-# Chat input area
-with st.form("chat_form", clear_on_submit=True):
-    st.subheader("Attach documents to search")
-    selected = st.multiselect(
-        "Indexed documents",
-        options=available_docs,
-        default=st.session_state.selected_docs,
-        help="Only chunks from these files will be searched. Leave empty to search all indexed content.",
-    )
-    question = st.text_area("Your question", placeholder="Ask about a specific article or case...", height=120)
-    top_k = st.slider("Results to retrieve", min_value=3, max_value=10, value=5, step=1)
-    submitted = st.form_submit_button("Ask")
+# Clear chat button in sidebar
+if st.sidebar.button("🗑️ Clear Chat History"):
+    st.session_state.messages = []
+    st.rerun()
 
-if submitted and question:
-    st.session_state.selected_docs = selected
-    with st.spinner("Retrieving context and querying Groq..."):
-        try:
-            contexts = search_context(question, selected, top_k=top_k)
-            answer = generate_answer(question, contexts)
-            st.session_state.chat_history.append({"role": "user", "content": question})
-            st.session_state.chat_history.append({"role": "assistant", "content": answer, "sources": contexts})
-            st.rerun()
-        except Exception as e:
-            st.error(f"Could not complete the request: {str(e)}")
+# Settings in sidebar
+with st.sidebar.expander("⚙️ Advanced Settings"):
+    st.write("**Current Configuration:**")
+    st.code(f"""
+Vector Store: FAISS (./faiss_index/)
+Embedding Model: {os.getenv('EMBEDDING_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2')}
+LLM Model: llama-3.3-70b-versatile (Groq)
+    """)
+    
+    # Show indexed documents summary
+    if registry:
+        st.write("**Indexed Documents:**")
+        for filename, info in registry.items():
+            st.write(f"- {filename}: {info['num_chunks']} chunks")
+
